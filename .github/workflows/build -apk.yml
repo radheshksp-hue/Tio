@@ -1,5 +1,5 @@
 
-name: Build APK from Uploaded ZIP
+name: Extract and Build Android APK
 
 on:
   workflow_dispatch:
@@ -11,16 +11,22 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: android-apk-build-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Extract and Build Android APK
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
+      # 1. Download repository files
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2. Locate the uploaded ZIP
       - name: Find uploaded project ZIP
         id: source
         shell: bash
@@ -30,28 +36,64 @@ jobs:
           ZIP_FILE="$(find "$GITHUB_WORKSPACE" \
             -type f -iname '*.zip' \
             -not -path '*/.git/*' \
+            -not -path '*/.gradle/*' \
             -print -quit)"
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "::error::No ZIP file found in repository."
+            echo "::error::No project ZIP found in repository."
             exit 1
           fi
 
           echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
-          echo "Found project ZIP: $(basename "$ZIP_FILE")"
+          echo "Found ZIP: $(basename "$ZIP_FILE")"
+          ls -lh "$ZIP_FILE"
 
+      # 3. Configure Java
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Extract ZIP safely
+      # 4. Configure Android SDK
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p "$RUNNER_TEMP/android-project"
+          SDKMANAGER="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::Android sdkmanager was not found."
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "build-tools;36.0.0"
+
+      # 5. Safely extract ZIP on the runner
+      - name: Extract ZIP safely
+        shell: bash
+        env:
+          ZIP_FILE: ${{ steps.source.outputs.zip_file }}
+        run: |
+          set -euo pipefail
+
+          DEST="$RUNNER_TEMP/android-project"
+          mkdir -p "$DEST"
 
           python3 - <<'PY'
           import os
@@ -59,103 +101,229 @@ jobs:
           import zipfile
           from pathlib import Path
 
-          archive = Path("${{ steps.source.outputs.zip_file }}")
-          # The path above is supplied by the workflow.
-          # Validate entries before extracting.
-          target = Path(os.environ["RUNNER_TEMP"]) / "android-project"
-          target = target.resolve()
+          archive = Path(os.environ["ZIP_FILE"])
+          target = (Path(os.environ["RUNNER_TEMP"]) /
+                    "android-project").resolve()
+
+          MAX_ENTRIES = 50000
+          MAX_EXPANDED = 2 * 1024 * 1024 * 1024
+          MAX_RATIO = 1000
+
+          if not zipfile.is_zipfile(archive):
+              raise SystemExit("Selected file is not a valid ZIP.")
 
           with zipfile.ZipFile(archive) as z:
               entries = z.infolist()
 
-              if len(entries) > 50000:
+              if len(entries) > MAX_ENTRIES:
                   raise SystemExit("ZIP contains too many entries.")
 
               total = 0
+              seen = set()
+
               for entry in entries:
                   name = entry.filename.replace("\\", "/")
                   parts = Path(name).parts
 
                   if name.startswith("/") or ".." in parts:
-                      raise SystemExit("Unsafe ZIP path detected.")
+                      raise SystemExit(f"Unsafe ZIP path: {name}")
+
+                  if parts and ":" in parts[0]:
+                      raise SystemExit("Absolute drive path rejected.")
+
+                  if name in seen:
+                      raise SystemExit(f"Duplicate ZIP entry: {name}")
+                  seen.add(name)
 
                   mode = entry.external_attr >> 16
                   if stat.S_ISLNK(mode):
-                      raise SystemExit("Symbolic links are not allowed.")
+                      raise SystemExit("ZIP symbolic links are not allowed.")
 
                   total += entry.file_size
-                  if total > 2 * 1024 * 1024 * 1024:
-                      raise SystemExit("Expanded ZIP exceeds 2 GB.")
+                  if total > MAX_EXPANDED:
+                      raise SystemExit("Expanded ZIP exceeds 2 GiB.")
 
-                  destination = (target / name).resolve()
-                  if destination != target and target not in destination.parents:
-                      raise SystemExit("ZIP path escapes extraction directory.")
+                  if entry.file_size > 0 and entry.compress_size == 0:
+                      raise SystemExit("Suspicious compressed ZIP entry.")
 
-              z.extractall(target)
+                  if entry.compress_size > 0 and (
+                      entry.file_size / entry.compress_size > MAX_RATIO
+                  ):
+                      raise SystemExit("Suspicious ZIP compression ratio.")
 
-          print("ZIP extracted and validated.")
+                  output = (target / name).resolve()
+                  if output != target and target not in output.parents:
+                      raise SystemExit("ZIP entry escapes extraction folder.")
+
+              for entry in entries:
+                  name = entry.filename.replace("\\", "/")
+                  output = (target / name).resolve()
+
+                  if entry.is_dir():
+                      output.mkdir(parents=True, exist_ok=True)
+                      continue
+
+                  output.parent.mkdir(parents=True, exist_ok=True)
+
+                  with z.open(entry) as src, output.open("xb") as dst:
+                      while True:
+                          chunk = src.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          dst.write(chunk)
+
+          print("ZIP validation and extraction completed.")
           PY
 
+      # 6. Find the actual project root
       - name: Locate Android project root
         id: project
         shell: bash
         run: |
           set -euo pipefail
 
-          ROOT="$RUNNER_TEMP/android-project"
+          BASE="$RUNNER_TEMP/android-project"
+          CANDIDATES="$RUNNER_TEMP/project-roots.txt"
+          : > "$CANDIDATES"
 
-          PROJECT_ROOT="$(
-            find "$ROOT" -type f \
-              \( -name settings.gradle -o -name settings.gradle.kts \) \
-              -not -path '*/.gradle/*' \
-              -printf '%h\n' |
-            while IFS= read -r dir; do
-              if [ -f "$dir/gradlew" ] &&
-                 [ -f "$dir/build.gradle.kts" -o -f "$dir/build.gradle" ]; then
-                printf '%s\n' "$dir"
-              fi
-            done | head -n 1
-          )"
+          while IFS= read -r SETTINGS; do
+            DIR="$(dirname "$SETTINGS")"
 
-          if [ -z "$PROJECT_ROOT" ]; then
-            echo "::error::Android project root not found."
-            echo "ZIP must contain settings.gradle(.kts) and gradlew."
+            if [ -f "$DIR/gradlew" ] &&
+               { [ -f "$DIR/build.gradle" ] ||
+                 [ -f "$DIR/build.gradle.kts" ]; } &&
+               { [ -f "$DIR/app/build.gradle" ] ||
+                 [ -f "$DIR/app/build.gradle.kts" ]; }; then
+              printf '%s\n' "$DIR" >> "$CANDIDATES"
+            fi
+          done < <(
+            find "$BASE" -type f \
+              \( -name settings.gradle \
+                 -o -name settings.gradle.kts \) \
+              -not -path '*/.gradle/*'
+          )
+
+          COUNT="$(wc -l < "$CANDIDATES" | tr -d ' ')"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No complete Android project root found."
+            echo "Required: settings.gradle(.kts), gradlew and app build file."
             exit 1
           fi
 
-          echo "root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
-          echo "Project root: $PROJECT_ROOT"
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::error::Multiple Android projects found in ZIP."
+            cat "$CANDIDATES"
+            echo "Please upload a ZIP containing one intended project."
+            exit 1
+          fi
 
+          ROOT="$(head -n 1 "$CANDIDATES")"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "Project root: $ROOT"
+
+      # 7. Repair a missing Wrapper JAR when possible
+      - name: Repair missing Gradle Wrapper JAR
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROPS="gradle/wrapper/gradle-wrapper.properties"
+          JAR="gradle/wrapper/gradle-wrapper.jar"
+
+          if [ ! -f "$PROPS" ]; then
+            echo "::error::Gradle wrapper properties are missing."
+            exit 1
+          fi
+
+          if [ -f "$JAR" ]; then
+            echo "Gradle Wrapper JAR exists."
+            exit 0
+          fi
+
+          echo "Wrapper JAR missing; checking configured Gradle version."
+
+          VERSION="$(
+            python3 - "$PROPS" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          text = Path(sys.argv[1]).read_text()
+          match = re.search(
+              r'^distributionUrl=.*?/gradle-([0-9]+(?:\.[0-9]+)+)-bin\.zip',
+              text,
+              re.MULTILINE
+          )
+          if not match:
+              raise SystemExit(
+                  "Cannot determine Gradle version from distributionUrl."
+              )
+          print(match.group(1))
+          PY
+          )"
+
+          # Only use this fallback for the explicitly supported version.
+          if [ "$VERSION" != "8.13" ]; then
+            echo "::error::Missing Wrapper JAR. Automatic repair is enabled only for Gradle 8.13."
+            echo "Provide the genuine Wrapper JAR or verify a compatible fallback."
+            exit 1
+          fi
+
+          BOOT="$RUNNER_TEMP/gradle-bootstrap"
+          mkdir -p "$BOOT"
+          cd "$BOOT"
+
+          curl --fail --location --retry 3 \
+            "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
+            -o gradle.zip
+
+          unzip -q -o gradle.zip
+
+          mkdir -p wrapper-project
+          cd wrapper-project
+          printf 'plugins {}\n' > build.gradle
+
+          "../gradle-${VERSION}/bin/gradle" wrapper \
+            --gradle-version "$VERSION" \
+            --distribution-type bin
+
+          if [ ! -s gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "::error::Gradle did not generate the Wrapper JAR."
+            exit 1
+          fi
+
+          PROJECT_ROOT="${{ steps.project.outputs.root }}"
+          mkdir -p "$PROJECT_ROOT/gradle/wrapper"
+
+          install -m 0644 gradle/wrapper/gradle-wrapper.jar \
+            "$PROJECT_ROOT/gradle/wrapper/gradle-wrapper.jar"
+
+          echo "Wrapper JAR generated for Gradle $VERSION."
+
+      # 8. Validate project files and wrapper
       - name: Verify Android project
         working-directory: ${{ steps.project.outputs.root }}
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ ! -f gradle/wrapper/gradle-wrapper.properties ]; then
-            echo "::error::Gradle Wrapper configuration missing."
-            exit 1
-          fi
-
-          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
-            echo "::error::Gradle Wrapper JAR missing."
-            exit 1
-          fi
+          test -f gradlew
+          test -f gradle/wrapper/gradle-wrapper.properties
+          test -s gradle/wrapper/gradle-wrapper.jar
+          test -f app/src/main/AndroidManifest.xml
 
           if [ ! -f app/build.gradle.kts ] &&
              [ ! -f app/build.gradle ]; then
-            echo "::error::app module build file missing."
-            exit 1
-          fi
-
-          if [ ! -f app/src/main/AndroidManifest.xml ]; then
-            echo "::error::Android manifest missing."
+            echo "::error::App module build file missing."
             exit 1
           fi
 
           chmod +x gradlew
           ./gradlew --version
 
+      # 9. Build APK and preserve actual output
       - name: Build Debug APK
         id: build
         working-directory: ${{ steps.project.outputs.root }}
@@ -165,6 +333,7 @@ jobs:
           ./gradlew --no-daemon --stacktrace assembleDebug \
             2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
 
+      # 10. Find generated APK
       - name: Locate APK
         if: success()
         id: apk
@@ -173,28 +342,38 @@ jobs:
         run: |
           set -euo pipefail
 
+          mkdir -p "$RUNNER_TEMP/apk-output"
+
+          find . -type f \
+            -path '*/build/outputs/apk/*/*.apk' \
+            -size +0c \
+            -print
+
           APK="$(find . -type f \
             -path '*/build/outputs/apk/*/*.apk' \
+            -size +0c \
             -print -quit)"
 
           if [ -z "$APK" ]; then
-            echo "::error::Build succeeded but no APK was found."
+            echo "::error::No non-empty APK was generated."
             exit 1
           fi
 
-          test -s "$APK"
-          echo "path=$APK" >> "$GITHUB_OUTPUT"
-          echo "APK generated: $APK"
+          cp "$APK" "$RUNNER_TEMP/apk-output/app-debug.apk"
+          echo "APK copied to artifact staging folder."
+          ls -lh "$RUNNER_TEMP/apk-output/app-debug.apk"
 
+      # 11. Upload APK artifact
       - name: Upload APK artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: android-debug-apk
-          path: ${{ steps.project.outputs.root }}/${{ steps.apk.outputs.path }}
+          path: ${{ runner.temp }}/apk-output/app-debug.apk
           if-no-files-found: error
           retention-days: 7
 
+      # 12. Always upload available build diagnostics
       - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -203,3 +382,4 @@ jobs:
           path: ${{ runner.temp }}/gradle-build.log
           if-no-files-found: ignore
           retention-days: 7
+          
